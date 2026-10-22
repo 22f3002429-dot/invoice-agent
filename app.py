@@ -932,3 +932,30 @@ async def cancel_task(
 
         c.execute(
             """UPDATE tasks
+               SET state='TASK_STATE_CANCELED',
+                   updated_at=?
+               WHERE task_id=?
+               AND principal=?
+               AND state NOT IN (
+                   'TASK_STATE_COMPLETED',
+                   'TASK_STATE_CANCELED'
+               )""",
+            (
+                now(),
+                task_id,
+                principal
+            )
+        )
+
+        c.commit()
+
+        row = c.execute(
+            """SELECT * FROM tasks
+               WHERE task_id=? AND principal=?""",
+            (task_id, principal)
+        ).fetchone()
+
+    return JSONResponse(
+        media_type="application/a2a+json",
+        content=task_response(row)
+    )
