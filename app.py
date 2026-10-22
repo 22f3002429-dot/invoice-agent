@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import logging
+import asyncio
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -39,8 +40,9 @@ RESULTS_MEDIA = "application/vnd.ga5.invoice-action-results+json"
 RECEIPTS_MEDIA = "application/vnd.ga5.invoice-action-receipts+json"
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_CHUNK_SIZE = 3
+GROQ_CHUNK_SIZE = 1
 GROQ_TIMEOUT = 40
+GROQ_MAX_RETRIES = 2
 
 app = FastAPI()
 
@@ -294,44 +296,100 @@ async def decide_chunk(chunk: list[dict]) -> dict[str, dict]:
         "packages": chunk
     })
 
-    async with httpx.AsyncClient(timeout=GROQ_TIMEOUT) as client:
-        response = await client.post(
-            GROQ_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
+    request_body = {
+        "model": GROQ_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
             },
-            json={
-                "model": GROQ_MODEL,
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": user_content
-                    }
-                ]
+            {
+                "role": "user",
+                "content": user_content
             }
-        )
-
-    logger.info(f"Groq status: {response.status_code}")
-
-    if response.status_code != 200:
-        logger.error(f"Groq error: {response.text}")
-        raise RuntimeError(f"Groq returned {response.status_code}")
-
-    payload = response.json()
-    content = payload["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
-
-    return {
-        item.get("packageId"): item
-        for item in parsed.get("decisions", [])
+        ]
     }
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    last_error = None
+
+    for attempt in range(GROQ_MAX_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=GROQ_TIMEOUT) as client:
+                response = await client.post(
+                    GROQ_URL,
+                    headers=headers,
+                    json=request_body
+                )
+
+            logger.info(f"Groq status: {response.status_code}")
+
+            if response.status_code == 200:
+                payload = response.json()
+                content = payload["choices"][0]["message"]["content"]
+                parsed = json.loads(content)
+
+                return {
+                    item.get("packageId"): item
+                    for item in parsed.get("decisions", [])
+                }
+
+            if response.status_code == 429:
+                error_text = response.text
+                logger.warning(f"Groq rate limit: {error_text}")
+
+                wait_seconds = 20.0
+
+                try:
+                    error_message = (
+                        response.json()
+                        .get("error", {})
+                        .get("message", "")
+                    )
+
+                    marker = "try again in "
+                    marker_position = error_message.find(marker)
+
+                    if marker_position >= 0:
+                        wait_text = (
+                            error_message[
+                                marker_position + len(marker):
+                            ].split("s")[0]
+                        )
+
+                        wait_seconds = min(float(wait_text), 20.0)
+
+                except Exception:
+                    pass
+
+                last_error = RuntimeError("Groq rate limit")
+
+                if attempt < GROQ_MAX_RETRIES:
+                    await asyncio.sleep(wait_seconds)
+                    continue
+
+                raise last_error
+
+            logger.error(f"Groq error: {response.text}")
+            raise RuntimeError(f"Groq returned {response.status_code}")
+
+        except httpx.RequestError as exc:
+            last_error = exc
+            logger.exception("Groq request failed")
+
+            if attempt < GROQ_MAX_RETRIES:
+                await asyncio.sleep(2)
+                continue
+
+            raise
+
+    raise last_error or RuntimeError("Groq request failed")
 
 
 async def groq_decide(packages: list[dict]) -> dict[str, dict]:
@@ -621,17 +679,41 @@ async def message_send(
                 )
             )
 
-        c.execute(
-            """INSERT INTO idempotency
-               (principal, message_id, content_hash, task_id)
-               VALUES (?, ?, ?, ?)""",
-            (
-                principal,
-                message_id,
-                message_hash,
-                task_id
+        try:
+            c.execute(
+                """INSERT INTO idempotency
+                   (principal, message_id, content_hash, task_id)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    principal,
+                    message_id,
+                    message_hash,
+                    task_id
+                )
             )
-        )
+        except sqlite3.IntegrityError:
+            c.rollback()
+
+            existing = c.execute(
+                """SELECT * FROM idempotency
+                   WHERE principal=? AND message_id=?""",
+                (principal, message_id)
+            ).fetchone()
+
+            if existing:
+                row = c.execute(
+                    """SELECT * FROM tasks
+                       WHERE task_id=? AND principal=?""",
+                    (existing["task_id"], principal)
+                ).fetchone()
+
+                if row:
+                    return JSONResponse(
+                        media_type="application/a2a+json",
+                        content={"task": task_response(row)}
+                    )
+
+            raise
 
         c.commit()
 
