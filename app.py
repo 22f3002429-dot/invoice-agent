@@ -685,4 +685,327 @@ async def message_send(
 
         c.commit()
 
-        row
+        row = c.execute(
+            """SELECT * FROM tasks
+               WHERE task_id=? AND principal=?""",
+            (task_id, principal)
+        ).fetchone()
+
+    return JSONResponse(
+        media_type="application/a2a+json",
+        content={"task": task_response(row)}
+    )
+
+
+async def handle_results(
+    principal: str,
+    message: dict,
+    result_data: dict,
+    message_hash: str
+):
+    task_id = message.get("taskId")
+    context_id = message.get("contextId")
+    message_id = message.get("messageId")
+    batch_id = result_data.get("batchId")
+    results = result_data.get("results") or []
+
+    if not task_id or not context_id or not message_id:
+        raise HTTPException(
+            status_code=400,
+            detail="taskId, contextId and messageId required"
+        )
+
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+
+        row = c.execute(
+            """SELECT * FROM tasks
+               WHERE task_id=? AND principal=?""",
+            (task_id, principal)
+        ).fetchone()
+
+        if not row:
+            c.rollback()
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        if row["context_id"] != context_id:
+            c.rollback()
+            raise HTTPException(status_code=403, detail="Context mismatch")
+
+        if row["batch_id"] != batch_id:
+            c.rollback()
+            raise HTTPException(status_code=403, detail="Batch mismatch")
+
+        if row["state"] == "TASK_STATE_COMPLETED":
+            c.commit()
+            return JSONResponse(
+                media_type="application/a2a+json",
+                content={"task": task_response(row)}
+            )
+
+        if row["state"] == "TASK_STATE_CANCELED":
+            c.rollback()
+            return a2a_error(
+                409,
+                "TASK_CANCELED",
+                "Task was canceled"
+            )
+
+        if row["state"] != "TASK_STATE_INPUT_REQUIRED":
+            c.rollback()
+            return a2a_error(
+                409,
+                "INVALID_TASK_STATE",
+                "Task is not awaiting results"
+            )
+
+        stored_proposals = {
+            row_item["packageId"]: row_item
+            for row_item in c.execute(
+                "SELECT * FROM proposals WHERE task_id=?",
+                (task_id,)
+            ).fetchall()
+        }
+
+        executions = []
+
+        for result in results:
+            package_id = result.get("packageId")
+            action_id = result.get("actionId")
+            action = result.get("action")
+            outcome = result.get("outcome")
+            receipt_nonce = result.get("receiptNonce")
+
+            stored = stored_proposals.get(package_id)
+
+            if (
+                not stored
+                or stored["action_id"] != action_id
+                or stored["action"] != action
+            ):
+                c.rollback()
+                raise HTTPException(
+                    status_code=403,
+                    detail="Result does not match stored proposal"
+                )
+
+            if outcome != "ACCEPTED":
+                continue
+
+            if not receipt_nonce:
+                c.rollback()
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing receiptNonce"
+                )
+
+            already = c.execute(
+                """SELECT 1 FROM receipts
+                   WHERE task_id=? AND package_id=?""",
+                (task_id, package_id)
+            ).fetchone()
+
+            if already:
+                continue
+
+            proposal_artifact = json.loads(row["proposal_artifact"])
+            proposal_data = proposal_artifact["parts"][0]["data"]
+
+            matching_proposal = next(
+                item for item in proposal_data["proposals"]
+                if item["packageId"] == package_id
+                and item["actionId"] == action_id
+            )
+
+            executions.append(
+                {
+                    "packageId": package_id,
+                    "actionId": action_id,
+                    "action": action,
+                    "receiptNonce": receipt_nonce,
+                    "facts": matching_proposal["facts"],
+                    "evidenceRefs": matching_proposal["evidenceRefs"]
+                }
+            )
+
+            c.execute(
+                """INSERT INTO receipts
+                   (task_id, package_id, action_id, receipt_nonce)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    task_id,
+                    package_id,
+                    action_id,
+                    receipt_nonce
+                )
+            )
+
+        if not executions:
+            c.rollback()
+            raise HTTPException(
+                status_code=400,
+                detail="No accepted executions"
+            )
+
+        receipt_artifact = {
+            "artifactId": str(uuid.uuid4()),
+            "name": "Invoice action receipts",
+            "parts": [
+                {
+                    "mediaType": RECEIPTS_MEDIA,
+                    "data": {
+                        "batchId": batch_id,
+                        "executions": executions
+                    }
+                }
+            ]
+        }
+
+        history = json.loads(row["history"])
+        history.append(message)
+
+        c.execute(
+            """UPDATE tasks
+               SET state='TASK_STATE_COMPLETED',
+                   history=?,
+                   receipt_artifact=?,
+                   updated_at=?
+               WHERE task_id=?
+               AND principal=?
+               AND state='TASK_STATE_INPUT_REQUIRED'""",
+            (
+                canonical_json(history),
+                canonical_json(receipt_artifact),
+                now(),
+                task_id,
+                principal
+            )
+        )
+
+        c.execute(
+            """INSERT INTO idempotency
+               (principal, message_id, content_hash, task_id)
+               VALUES (?, ?, ?, ?)""",
+            (
+                principal,
+                message_id,
+                message_hash,
+                task_id
+            )
+        )
+
+        c.commit()
+
+        row = c.execute(
+            """SELECT * FROM tasks
+               WHERE task_id=? AND principal=?""",
+            (task_id, principal)
+        ).fetchone()
+
+    return JSONResponse(
+        media_type="application/a2a+json",
+        content={"task": task_response(row)}
+    )
+
+
+@app.get("/a2a/tasks/{task_id}")
+async def get_task(
+    task_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None)
+):
+    principal = await guard(request, authorization)
+
+    with db() as c:
+        row = get_task_for_principal(c, task_id, principal)
+
+    return JSONResponse(
+        media_type="application/a2a+json",
+        content=task_response(row)
+    )
+
+
+@app.get("/a2a/tasks")
+async def list_tasks(
+    request: Request,
+    authorization: str | None = Header(default=None)
+):
+    principal = await guard(request, authorization)
+
+    with db() as c:
+        rows = c.execute(
+            """SELECT * FROM tasks
+               WHERE principal=?
+               ORDER BY created_at""",
+            (principal,)
+        ).fetchall()
+
+    return JSONResponse(
+        media_type="application/a2a+json",
+        content={
+            "tasks": [task_response(row) for row in rows]
+        }
+    )
+
+
+@app.post("/a2a/tasks/{task_id}:cancel")
+async def cancel_task(
+    task_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None)
+):
+    principal = await guard(request, authorization)
+
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+
+        row = c.execute(
+            """SELECT * FROM tasks
+               WHERE task_id=? AND principal=?""",
+            (task_id, principal)
+        ).fetchone()
+
+        if not row:
+            c.rollback()
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        if row["state"] in (
+            "TASK_STATE_COMPLETED",
+            "TASK_STATE_CANCELED"
+        ):
+            c.rollback()
+            return a2a_error(
+                409,
+                "TASK_TERMINAL",
+                "Task already terminal"
+            )
+
+        c.execute(
+            """UPDATE tasks
+               SET state='TASK_STATE_CANCELED',
+                   updated_at=?
+               WHERE task_id=?
+               AND principal=?
+               AND state NOT IN (
+                   'TASK_STATE_COMPLETED',
+                   'TASK_STATE_CANCELED'
+               )""",
+            (
+                now(),
+                task_id,
+                principal
+            )
+        )
+
+        c.commit()
+
+        row = c.execute(
+            """SELECT * FROM tasks
+               WHERE task_id=? AND principal=?""",
+            (task_id, principal)
+        ).fetchone()
+
+    return JSONResponse(
+        media_type="application/a2a+json",
+        content=task_response(row)
+    )
