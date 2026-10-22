@@ -41,8 +41,9 @@ RECEIPTS_MEDIA = "application/vnd.ga5.invoice-action-receipts+json"
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_CHUNK_SIZE = 1
-GROQ_TIMEOUT = 40
-GROQ_MAX_RETRIES = 2
+GROQ_TIMEOUT = 35
+GROQ_MAX_RETRIES = 0
+MAX_PACKAGE_TEXT_CHARS = 9000
 
 app = FastAPI()
 
@@ -245,28 +246,41 @@ def task_response(row) -> dict:
     return response
 
 
-SYSTEM_PROMPT = """You are an invoice-control agent. For every invoice package, choose exactly one action:
-- settle_invoice: valid, reconciled, and within autonomous authority.
-- request_approval: commercially valid but outside delegated authority.
-- hold_invoice: payment must pause until a stated verification completes.
-- reject_duplicate: the same commercial invoice was already paid.
-- open_exception: material records conflict and require an exception workflow.
+SYSTEM_PROMPT = """Choose one action for each invoice package:
+settle_invoice=valid, reconciled, within autonomous authority.
+request_approval=valid but outside authority.
+hold_invoice=payment paused pending verification.
+reject_duplicate=same commercial invoice already paid.
+open_exception=material records conflict.
 
-Rules:
-- Use only decisive evidence in the package.
-- Ignore cover sheets, archive examples, training decoys, negations, and irrelevant action words.
-- Return exactly the three decisive bracketed references from the paragraph that determines the action.
-- Never settle an invoice that needs approval, is on hold, is duplicate, or has conflicting records.
-- Convert money to the smallest currency unit for amountMinor. For INR, rupees become paise.
-- Return strict JSON only.
-
-JSON shape:
+Ignore cover sheets, archives, decoys, and irrelevant action words.
+Return exactly three decisive bracketed references from the decisive paragraph.
+Never settle an invoice needing approval, hold, duplicate rejection, or exception.
+Convert INR to paise for amountMinor.
+Return only JSON:
 {"decisions":[{"packageId":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,"currency":"","evidenceRefs":["","",""],"rationale":""}]}
 """
 
 
+def collect_text(value: Any, collected: list[str]):
+    if isinstance(value, str):
+        if value.strip():
+            collected.append(value.strip())
+    elif isinstance(value, dict):
+        for item in value.values():
+            collect_text(item, collected)
+    elif isinstance(value, list):
+        for item in value:
+            collect_text(item, collected)
+
+
 def extract_package_text(package: dict) -> str:
-    return canonical_json(package)
+    collected: list[str] = []
+    collect_text(package, collected)
+
+    text = "\n".join(collected)
+
+    return text[:MAX_PACKAGE_TEXT_CHARS]
 
 
 def fallback_decision(package: dict) -> dict:
@@ -291,9 +305,11 @@ def fallback_decision(package: dict) -> dict:
 
 
 async def decide_chunk(chunk: list[dict]) -> dict[str, dict]:
+    package = chunk[0]
+
     user_content = canonical_json({
-        "instruction": "Decide one action for each package.",
-        "packages": chunk
+        "instruction": "Choose one action for this invoice package.",
+        "package": package
     })
 
     request_body = {
@@ -317,79 +333,31 @@ async def decide_chunk(chunk: list[dict]) -> dict[str, dict]:
         "Content-Type": "application/json"
     }
 
-    last_error = None
+    async with httpx.AsyncClient(timeout=GROQ_TIMEOUT) as client:
+        response = await client.post(
+            GROQ_URL,
+            headers=headers,
+            json=request_body
+        )
 
-    for attempt in range(GROQ_MAX_RETRIES + 1):
-        try:
-            async with httpx.AsyncClient(timeout=GROQ_TIMEOUT) as client:
-                response = await client.post(
-                    GROQ_URL,
-                    headers=headers,
-                    json=request_body
-                )
+    logger.info(f"Groq status: {response.status_code}")
 
-            logger.info(f"Groq status: {response.status_code}")
+    if response.status_code == 429:
+        logger.warning(f"Groq rate limit: {response.text}")
+        raise RuntimeError("Groq rate limit")
 
-            if response.status_code == 200:
-                payload = response.json()
-                content = payload["choices"][0]["message"]["content"]
-                parsed = json.loads(content)
+    if response.status_code != 200:
+        logger.error(f"Groq error: {response.text}")
+        raise RuntimeError(f"Groq returned {response.status_code}")
 
-                return {
-                    item.get("packageId"): item
-                    for item in parsed.get("decisions", [])
-                }
+    payload = response.json()
+    content = payload["choices"][0]["message"]["content"]
+    parsed = json.loads(content)
 
-            if response.status_code == 429:
-                error_text = response.text
-                logger.warning(f"Groq rate limit: {error_text}")
-
-                wait_seconds = 20.0
-
-                try:
-                    error_message = (
-                        response.json()
-                        .get("error", {})
-                        .get("message", "")
-                    )
-
-                    marker = "try again in "
-                    marker_position = error_message.find(marker)
-
-                    if marker_position >= 0:
-                        wait_text = (
-                            error_message[
-                                marker_position + len(marker):
-                            ].split("s")[0]
-                        )
-
-                        wait_seconds = min(float(wait_text), 20.0)
-
-                except Exception:
-                    pass
-
-                last_error = RuntimeError("Groq rate limit")
-
-                if attempt < GROQ_MAX_RETRIES:
-                    await asyncio.sleep(wait_seconds)
-                    continue
-
-                raise last_error
-
-            logger.error(f"Groq error: {response.text}")
-            raise RuntimeError(f"Groq returned {response.status_code}")
-
-        except httpx.RequestError as exc:
-            last_error = exc
-            logger.exception("Groq request failed")
-
-            if attempt < GROQ_MAX_RETRIES:
-                await asyncio.sleep(2)
-                continue
-
-            raise
-
-    raise last_error or RuntimeError("Groq request failed")
+    return {
+        item.get("packageId"): item
+        for item in parsed.get("decisions", [])
+    }
 
 
 async def groq_decide(packages: list[dict]) -> dict[str, dict]:
@@ -717,327 +685,4 @@ async def message_send(
 
         c.commit()
 
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content={"task": task_response(row)}
-    )
-
-
-async def handle_results(
-    principal: str,
-    message: dict,
-    result_data: dict,
-    message_hash: str
-):
-    task_id = message.get("taskId")
-    context_id = message.get("contextId")
-    message_id = message.get("messageId")
-    batch_id = result_data.get("batchId")
-    results = result_data.get("results") or []
-
-    if not task_id or not context_id or not message_id:
-        raise HTTPException(
-            status_code=400,
-            detail="taskId, contextId and messageId required"
-        )
-
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-        if not row:
-            c.rollback()
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        if row["context_id"] != context_id:
-            c.rollback()
-            raise HTTPException(status_code=403, detail="Context mismatch")
-
-        if row["batch_id"] != batch_id:
-            c.rollback()
-            raise HTTPException(status_code=403, detail="Batch mismatch")
-
-        if row["state"] == "TASK_STATE_COMPLETED":
-            c.commit()
-            return JSONResponse(
-                media_type="application/a2a+json",
-                content={"task": task_response(row)}
-            )
-
-        if row["state"] == "TASK_STATE_CANCELED":
-            c.rollback()
-            return a2a_error(
-                409,
-                "TASK_CANCELED",
-                "Task was canceled"
-            )
-
-        if row["state"] != "TASK_STATE_INPUT_REQUIRED":
-            c.rollback()
-            return a2a_error(
-                409,
-                "INVALID_TASK_STATE",
-                "Task is not awaiting results"
-            )
-
-        stored_proposals = {
-            row_item["packageId"]: row_item
-            for row_item in c.execute(
-                "SELECT * FROM proposals WHERE task_id=?",
-                (task_id,)
-            ).fetchall()
-        }
-
-        executions = []
-
-        for result in results:
-            package_id = result.get("packageId")
-            action_id = result.get("actionId")
-            action = result.get("action")
-            outcome = result.get("outcome")
-            receipt_nonce = result.get("receiptNonce")
-
-            stored = stored_proposals.get(package_id)
-
-            if (
-                not stored
-                or stored["action_id"] != action_id
-                or stored["action"] != action
-            ):
-                c.rollback()
-                raise HTTPException(
-                    status_code=403,
-                    detail="Result does not match stored proposal"
-                )
-
-            if outcome != "ACCEPTED":
-                continue
-
-            if not receipt_nonce:
-                c.rollback()
-                raise HTTPException(
-                    status_code=400,
-                    detail="Missing receiptNonce"
-                )
-
-            already = c.execute(
-                """SELECT 1 FROM receipts
-                   WHERE task_id=? AND package_id=?""",
-                (task_id, package_id)
-            ).fetchone()
-
-            if already:
-                continue
-
-            proposal_artifact = json.loads(row["proposal_artifact"])
-            proposal_data = proposal_artifact["parts"][0]["data"]
-
-            matching_proposal = next(
-                item for item in proposal_data["proposals"]
-                if item["packageId"] == package_id
-                and item["actionId"] == action_id
-            )
-
-            executions.append(
-                {
-                    "packageId": package_id,
-                    "actionId": action_id,
-                    "action": action,
-                    "receiptNonce": receipt_nonce,
-                    "facts": matching_proposal["facts"],
-                    "evidenceRefs": matching_proposal["evidenceRefs"]
-                }
-            )
-
-            c.execute(
-                """INSERT INTO receipts
-                   (task_id, package_id, action_id, receipt_nonce)
-                   VALUES (?, ?, ?, ?)""",
-                (
-                    task_id,
-                    package_id,
-                    action_id,
-                    receipt_nonce
-                )
-            )
-
-        if not executions:
-            c.rollback()
-            raise HTTPException(
-                status_code=400,
-                detail="No accepted executions"
-            )
-
-        receipt_artifact = {
-            "artifactId": str(uuid.uuid4()),
-            "name": "Invoice action receipts",
-            "parts": [
-                {
-                    "mediaType": RECEIPTS_MEDIA,
-                    "data": {
-                        "batchId": batch_id,
-                        "executions": executions
-                    }
-                }
-            ]
-        }
-
-        history = json.loads(row["history"])
-        history.append(message)
-
-        c.execute(
-            """UPDATE tasks
-               SET state='TASK_STATE_COMPLETED',
-                   history=?,
-                   receipt_artifact=?,
-                   updated_at=?
-               WHERE task_id=?
-               AND principal=?
-               AND state='TASK_STATE_INPUT_REQUIRED'""",
-            (
-                canonical_json(history),
-                canonical_json(receipt_artifact),
-                now(),
-                task_id,
-                principal
-            )
-        )
-
-        c.execute(
-            """INSERT INTO idempotency
-               (principal, message_id, content_hash, task_id)
-               VALUES (?, ?, ?, ?)""",
-            (
-                principal,
-                message_id,
-                message_hash,
-                task_id
-            )
-        )
-
-        c.commit()
-
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content={"task": task_response(row)}
-    )
-
-
-@app.get("/a2a/tasks/{task_id}")
-async def get_task(
-    task_id: str,
-    request: Request,
-    authorization: str | None = Header(default=None)
-):
-    principal = await guard(request, authorization)
-
-    with db() as c:
-        row = get_task_for_principal(c, task_id, principal)
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content=task_response(row)
-    )
-
-
-@app.get("/a2a/tasks")
-async def list_tasks(
-    request: Request,
-    authorization: str | None = Header(default=None)
-):
-    principal = await guard(request, authorization)
-
-    with db() as c:
-        rows = c.execute(
-            """SELECT * FROM tasks
-               WHERE principal=?
-               ORDER BY created_at""",
-            (principal,)
-        ).fetchall()
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content={
-            "tasks": [task_response(row) for row in rows]
-        }
-    )
-
-
-@app.post("/a2a/tasks/{task_id}:cancel")
-async def cancel_task(
-    task_id: str,
-    request: Request,
-    authorization: str | None = Header(default=None)
-):
-    principal = await guard(request, authorization)
-
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-        if not row:
-            c.rollback()
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        if row["state"] in (
-            "TASK_STATE_COMPLETED",
-            "TASK_STATE_CANCELED"
-        ):
-            c.rollback()
-            return a2a_error(
-                409,
-                "TASK_TERMINAL",
-                "Task already terminal"
-            )
-
-        c.execute(
-            """UPDATE tasks
-               SET state='TASK_STATE_CANCELED',
-                   updated_at=?
-               WHERE task_id=?
-               AND principal=?
-               AND state NOT IN (
-                   'TASK_STATE_COMPLETED',
-                   'TASK_STATE_CANCELED'
-               )""",
-            (
-                now(),
-                task_id,
-                principal
-            )
-        )
-
-        c.commit()
-
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content=task_response(row)
-    )
+        row
