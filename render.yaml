@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: a2a-invoice-agent
+    runtime: docker
+    plan: free
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PUBLIC_BASE_URL
+        value: https://a2a-invoice-agent.onrender.com/a2a
+      - key: GROQ_MODEL
+        value: llama-3.1-8b-instant
