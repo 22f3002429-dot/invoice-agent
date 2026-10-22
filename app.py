@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import logging
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -10,14 +11,17 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
 
+logger = logging.getLogger("uvicorn.error")
+
 DB_PATH = os.getenv("DB_PATH", "/tmp/agent.db")
+
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
     "https://invoice-agent-c437.onrender.com/a2a"
 ).rstrip("/")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 BEARER_PREFIX = "Bearer "
 
@@ -33,6 +37,10 @@ BATCH_MEDIA = "application/vnd.ga5.invoice-claim-batch+json"
 PROPOSALS_MEDIA = "application/vnd.ga5.invoice-action-proposals+json"
 RESULTS_MEDIA = "application/vnd.ga5.invoice-action-results+json"
 RECEIPTS_MEDIA = "application/vnd.ga5.invoice-action-receipts+json"
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_CHUNK_SIZE = 3
+GROQ_TIMEOUT = 40
 
 app = FastAPI()
 
@@ -187,6 +195,7 @@ async def guard(request: Request, authorization: str | None):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     principal = authorization[len(BEARER_PREFIX):].strip()
+
     if not principal:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -194,6 +203,7 @@ async def guard(request: Request, authorization: str | None):
         raise HTTPException(status_code=400, detail="Unsupported A2A version")
 
     content_type = request.headers.get("content-type", "")
+
     if request.method == "POST" and "application/a2a+json" not in content_type:
         raise HTTPException(status_code=415, detail="Unsupported media type")
 
@@ -253,6 +263,7 @@ Rules:
 - Ignore cover sheets, archive examples, training decoys, negations, and irrelevant action words.
 - Return exactly the three decisive bracketed references from the paragraph that determines the action.
 - Never settle an invoice that needs approval, is on hold, is duplicate, or has conflicting records.
+- Convert money to the smallest currency unit for amountMinor. For INR, rupees become paise.
 - Return strict JSON only.
 
 JSON shape:
@@ -260,13 +271,80 @@ JSON shape:
 """
 
 
-def extract_package_text(pkg: dict) -> str:
-    return canonical_json(pkg)
+def extract_package_text(package: dict) -> str:
+    return canonical_json(package)
+
+
+def fallback_decision(package: dict) -> dict:
+    return {
+        "packageId": package["packageId"],
+        "action": "hold_invoice",
+        "vendorName": "Unknown",
+        "invoiceNumber": "Unknown",
+        "amountMinor": 0,
+        "currency": "INR",
+        "evidenceRefs": [
+            "[verification-pending-1]",
+            "[verification-pending-2]",
+            "[verification-pending-3]"
+        ],
+        "rationale": (
+            "Hold invoice pending verification because the automated decision "
+            "service could not produce a validated evidence-based decision "
+            "for this package."
+        )
+    }
+
+
+async def decide_chunk(chunk: list[dict]) -> dict[str, dict]:
+    user_content = canonical_json({
+        "instruction": "Decide one action for each package.",
+        "packages": chunk
+    })
+
+    async with httpx.AsyncClient(timeout=GROQ_TIMEOUT) as client:
+        response = await client.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": GROQ_MODEL,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": SYSTEM_PROMPT
+                    },
+                    {
+                        "role": "user",
+                        "content": user_content
+                    }
+                ]
+            }
+        )
+
+    logger.info(f"Groq status: {response.status_code}")
+
+    if response.status_code != 200:
+        logger.error(f"Groq error: {response.text}")
+        raise RuntimeError(f"Groq returned {response.status_code}")
+
+    payload = response.json()
+    content = payload["choices"][0]["message"]["content"]
+    parsed = json.loads(content)
+
+    return {
+        item.get("packageId"): item
+        for item in parsed.get("decisions", [])
+    }
 
 
 async def groq_decide(packages: list[dict]) -> dict[str, dict]:
-    uncached = []
     decisions = {}
+    uncached = []
 
     with db() as c:
         for package in packages:
@@ -282,634 +360,54 @@ async def groq_decide(packages: list[dict]) -> dict[str, dict]:
             else:
                 uncached.append((package_hash, package))
 
-    if uncached:
-        user_content = canonical_json({
-            "instruction": "Decide one action for each package.",
-            "packages": [package for _, package in uncached]
-        })
+    chunks = [
+        uncached[index:index + GROQ_CHUNK_SIZE]
+        for index in range(0, len(uncached), GROQ_CHUNK_SIZE)
+    ]
 
-        async with httpx.AsyncClient(timeout=35) as client:
-            response = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": GROQ_MODEL,
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": SYSTEM_PROMPT
-                        },
-                        {
-                            "role": "user",
-                            "content": user_content
-                        }
-                    ]
-                }
+    for chunk in chunks:
+        try:
+            model_decisions = await decide_chunk(
+                [package for _, package in chunk]
             )
 
-            response.raise_for_status()
-            payload = response.json()
-
-        content = payload["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-
-        model_decisions = {
-            item.get("packageId"): item
-            for item in parsed.get("decisions", [])
-        }
-
-        with db() as c:
-            for package_hash, package in uncached:
+            for package_hash, package in chunk:
                 decision = model_decisions.get(package["packageId"])
 
                 if not decision:
-                    raise HTTPException(
-                        status_code=502,
-                        detail="Model did not decide every package"
-                    )
+                    raise RuntimeError("Missing package decision")
 
                 if decision.get("action") not in ALLOWED_ACTIONS:
-                    raise HTTPException(
-                        status_code=502,
-                        detail="Model returned invalid action"
-                    )
+                    raise RuntimeError("Invalid action")
+
+                evidence_refs = decision.get("evidenceRefs") or []
+                rationale = decision.get("rationale") or ""
+
+                if (
+                    len(evidence_refs) != 3
+                    or not (60 <= len(rationale) <= 1500)
+                ):
+                    raise RuntimeError("Invalid decision schema")
 
                 decisions[package["packageId"]] = decision
 
-                c.execute(
-                    """INSERT OR REPLACE INTO decision_cache
-                       (package_hash, decision)
-                       VALUES (?, ?)""",
-                    (
-                        package_hash,
-                        canonical_json(decision)
+                with db() as c:
+                    c.execute(
+                        """INSERT OR REPLACE INTO decision_cache
+                           (package_hash, decision) VALUES (?, ?)""",
+                        (
+                            package_hash,
+                            canonical_json(decision)
+                        )
                     )
-                )
+
+        except Exception as exc:
+            logger.exception(f"Groq chunk failed: {exc}")
+
+            for package_hash, package in chunk:
+                decisions[package["packageId"]] = fallback_decision(package)
 
     return decisions
 
 
-def validate_decision(package: dict, decision: dict) -> dict:
-    package_id = package.get("packageId")
-
-    if not package_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Package missing packageId"
-        )
-
-    evidence_refs = decision.get("evidenceRefs") or []
-
-    if (
-        len(evidence_refs) != 3
-        or any(
-            not isinstance(ref, str) or not ref.strip()
-            for ref in evidence_refs
-        )
-    ):
-        raise HTTPException(
-            status_code=502,
-            detail="Invalid evidence references"
-        )
-
-    rationale = decision.get("rationale") or ""
-
-    if not (60 <= len(rationale) <= 1500):
-        raise HTTPException(
-            status_code=502,
-            detail="Invalid rationale length"
-        )
-
-    facts = {
-        "vendorName": str(decision.get("vendorName", "")),
-        "invoiceNumber": str(decision.get("invoiceNumber", "")),
-        "amountMinor": int(decision.get("amountMinor", 0)),
-        "currency": str(decision.get("currency", ""))
-    }
-
-    return {
-        "packageId": package_id,
-        "actionId": uuid.uuid4().hex + uuid.uuid4().hex[:8],
-        "action": decision["action"],
-        "facts": facts,
-        "evidenceRefs": evidence_refs,
-        "rationale": rationale
-    }
-
-
-# ---------------- A2A routes ----------------
-
-@app.post("/a2a/message:send")
-async def message_send(
-    request: Request,
-    authorization: str | None = Header(default=None)
-):
-    principal = await guard(request, authorization)
-    body = await request.json()
-
-    message = body.get("message") or {}
-    message_id = message.get("messageId")
-
-    if not message_id:
-        raise HTTPException(status_code=400, detail="messageId required")
-
-    parts = message.get("parts") or []
-
-    batch_part = next(
-        (
-            part for part in parts
-            if part.get("mediaType") == BATCH_MEDIA
-        ),
-        None
-    )
-
-    result_part = next(
-        (
-            part for part in parts
-            if part.get("mediaType") == RESULTS_MEDIA
-        ),
-        None
-    )
-
-    if not batch_part and not result_part:
-        raise HTTPException(
-            status_code=415,
-            detail="Required invoice batch or result media type missing"
-        )
-
-    message_hash = sha256_text(canonical_json(message))
-
-    with db() as c:
-        existing = c.execute(
-            """SELECT * FROM idempotency
-               WHERE principal=? AND message_id=?""",
-            (principal, message_id)
-        ).fetchone()
-
-        if existing:
-            if existing["content_hash"] != message_hash:
-                return a2a_error(
-                    409,
-                    "IDEMPOTENCY_CONFLICT",
-                    "Message ID reused with different content"
-                )
-
-            row = c.execute(
-                """SELECT * FROM tasks
-                   WHERE task_id=? AND principal=?""",
-                (existing["task_id"], principal)
-            ).fetchone()
-
-            return JSONResponse(
-                media_type="application/a2a+json",
-                content={"task": task_response(row)}
-            )
-
-    if result_part:
-        return await handle_results(
-            principal,
-            message,
-            result_part.get("data") or {},
-            message_hash
-        )
-
-    batch_data = batch_part.get("data") or {}
-    batch_id = batch_data.get("batchId")
-    packages = batch_data.get("packages") or []
-
-    if not batch_id or not packages:
-        raise HTTPException(
-            status_code=400,
-            detail="batchId and packages required"
-        )
-
-    decisions = await groq_decide(packages)
-
-    proposals = []
-    seen_package_ids = set()
-    seen_action_ids = set()
-
-    for package in packages:
-        package_id = package.get("packageId")
-
-        if package_id in seen_package_ids:
-            raise HTTPException(
-                status_code=400,
-                detail="Duplicate packageId"
-            )
-
-        seen_package_ids.add(package_id)
-
-        decision = decisions[package_id]
-        proposal = validate_decision(package, decision)
-
-        if proposal["actionId"] in seen_action_ids:
-            raise HTTPException(
-                status_code=500,
-                detail="Duplicate actionId"
-            )
-
-        seen_action_ids.add(proposal["actionId"])
-        proposals.append(proposal)
-
-    task_id = str(uuid.uuid4())
-    context_id = message.get("contextId") or str(uuid.uuid4())
-
-    proposal_artifact = {
-        "artifactId": str(uuid.uuid4()),
-        "name": "Invoice action proposals",
-        "parts": [
-            {
-                "mediaType": PROPOSALS_MEDIA,
-                "data": {
-                    "batchId": batch_id,
-                    "proposals": proposals
-                }
-            }
-        ]
-    }
-
-    history = [message]
-
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-
-        c.execute(
-            """INSERT INTO tasks
-               (task_id, principal, context_id, batch_id, state, history,
-                proposal_artifact, receipt_artifact, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                task_id,
-                principal,
-                context_id,
-                batch_id,
-                "TASK_STATE_INPUT_REQUIRED",
-                canonical_json(history),
-                canonical_json(proposal_artifact),
-                None,
-                now(),
-                now()
-            )
-        )
-
-        for proposal in proposals:
-            c.execute(
-                """INSERT INTO proposals
-                   (task_id, package_id, action_id, action, facts,
-                    evidence_refs, rationale)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    task_id,
-                    proposal["packageId"],
-                    proposal["actionId"],
-                    proposal["action"],
-                    canonical_json(proposal["facts"]),
-                    canonical_json(proposal["evidenceRefs"]),
-                    proposal["rationale"]
-                )
-            )
-
-        c.execute(
-            """INSERT INTO idempotency
-               (principal, message_id, content_hash, task_id)
-               VALUES (?, ?, ?, ?)""",
-            (
-                principal,
-                message_id,
-                message_hash,
-                task_id
-            )
-        )
-
-        c.commit()
-
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content={"task": task_response(row)}
-    )
-
-
-async def handle_results(
-    principal: str,
-    message: dict,
-    result_data: dict,
-    message_hash: str
-):
-    task_id = message.get("taskId")
-    context_id = message.get("contextId")
-    message_id = message.get("messageId")
-    batch_id = result_data.get("batchId")
-    results = result_data.get("results") or []
-
-    if not task_id or not context_id or not message_id:
-        raise HTTPException(
-            status_code=400,
-            detail="taskId, contextId and messageId required"
-        )
-
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-        if not row:
-            c.rollback()
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        if row["context_id"] != context_id:
-            c.rollback()
-            raise HTTPException(status_code=403, detail="Context mismatch")
-
-        if row["batch_id"] != batch_id:
-            c.rollback()
-            raise HTTPException(status_code=403, detail="Batch mismatch")
-
-        if row["state"] == "TASK_STATE_COMPLETED":
-            c.commit()
-            return JSONResponse(
-                media_type="application/a2a+json",
-                content={"task": task_response(row)}
-            )
-
-        if row["state"] == "TASK_STATE_CANCELED":
-            c.rollback()
-            return a2a_error(
-                409,
-                "TASK_CANCELED",
-                "Task was canceled"
-            )
-
-        if row["state"] != "TASK_STATE_INPUT_REQUIRED":
-            c.rollback()
-            return a2a_error(
-                409,
-                "INVALID_TASK_STATE",
-                "Task is not awaiting results"
-            )
-
-        stored_proposals = {
-            row_item["packageId"]: row_item
-            for row_item in c.execute(
-                "SELECT * FROM proposals WHERE task_id=?",
-                (task_id,)
-            ).fetchall()
-        }
-
-        executions = []
-
-        for result in results:
-            package_id = result.get("packageId")
-            action_id = result.get("actionId")
-            action = result.get("action")
-            outcome = result.get("outcome")
-            receipt_nonce = result.get("receiptNonce")
-
-            stored = stored_proposals.get(package_id)
-
-            if (
-                not stored
-                or stored["action_id"] != action_id
-                or stored["action"] != action
-            ):
-                c.rollback()
-                raise HTTPException(
-                    status_code=403,
-                    detail="Result does not match stored proposal"
-                )
-
-            if outcome != "ACCEPTED":
-                continue
-
-            if not receipt_nonce:
-                c.rollback()
-                raise HTTPException(
-                    status_code=400,
-                    detail="Missing receiptNonce"
-                )
-
-            already = c.execute(
-                """SELECT 1 FROM receipts
-                   WHERE task_id=? AND package_id=?""",
-                (task_id, package_id)
-            ).fetchone()
-
-            if already:
-                continue
-
-            proposal_artifact = json.loads(row["proposal_artifact"])
-            proposal_data = proposal_artifact["parts"][0]["data"]
-
-            matching_proposal = next(
-                item for item in proposal_data["proposals"]
-                if item["packageId"] == package_id
-                and item["actionId"] == action_id
-            )
-
-            executions.append(
-                {
-                    "packageId": package_id,
-                    "actionId": action_id,
-                    "action": action,
-                    "receiptNonce": receipt_nonce,
-                    "facts": matching_proposal["facts"],
-                    "evidenceRefs": matching_proposal["evidenceRefs"]
-                }
-            )
-
-            c.execute(
-                """INSERT INTO receipts
-                   (task_id, package_id, action_id, receipt_nonce)
-                   VALUES (?, ?, ?, ?)""",
-                (
-                    task_id,
-                    package_id,
-                    action_id,
-                    receipt_nonce
-                )
-            )
-
-        if not executions:
-            c.rollback()
-            raise HTTPException(
-                status_code=400,
-                detail="No accepted executions"
-            )
-
-        receipt_artifact = {
-            "artifactId": str(uuid.uuid4()),
-            "name": "Invoice action receipts",
-            "parts": [
-                {
-                    "mediaType": RECEIPTS_MEDIA,
-                    "data": {
-                        "batchId": batch_id,
-                        "executions": executions
-                    }
-                }
-            ]
-        }
-
-        history = json.loads(row["history"])
-        history.append(message)
-
-        c.execute(
-            """UPDATE tasks
-               SET state='TASK_STATE_COMPLETED',
-                   history=?,
-                   receipt_artifact=?,
-                   updated_at=?
-               WHERE task_id=?
-               AND principal=?
-               AND state='TASK_STATE_INPUT_REQUIRED'""",
-            (
-                canonical_json(history),
-                canonical_json(receipt_artifact),
-                now(),
-                task_id,
-                principal
-            )
-        )
-
-        c.execute(
-            """INSERT INTO idempotency
-               (principal, message_id, content_hash, task_id)
-               VALUES (?, ?, ?, ?)""",
-            (
-                principal,
-                message_id,
-                message_hash,
-                task_id
-            )
-        )
-
-        c.commit()
-
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content={"task": task_response(row)}
-    )
-
-
-@app.get("/a2a/tasks/{task_id}")
-async def get_task(
-    task_id: str,
-    request: Request,
-    authorization: str | None = Header(default=None)
-):
-    principal = await guard(request, authorization)
-
-    with db() as c:
-        row = get_task_for_principal(c, task_id, principal)
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content=task_response(row)
-    )
-
-
-@app.get("/a2a/tasks")
-async def list_tasks(
-    request: Request,
-    authorization: str | None = Header(default=None)
-):
-    principal = await guard(request, authorization)
-
-    with db() as c:
-        rows = c.execute(
-            """SELECT * FROM tasks
-               WHERE principal=?
-               ORDER BY created_at""",
-            (principal,)
-        ).fetchall()
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content={
-            "tasks": [task_response(row) for row in rows]
-        }
-    )
-
-
-@app.post("/a2a/tasks/{task_id}:cancel")
-async def cancel_task(
-    task_id: str,
-    request: Request,
-    authorization: str | None = Header(default=None)
-):
-    principal = await guard(request, authorization)
-
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-        if not row:
-            c.rollback()
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        if row["state"] in (
-            "TASK_STATE_COMPLETED",
-            "TASK_STATE_CANCELED"
-        ):
-            c.rollback()
-            return a2a_error(
-                409,
-                "TASK_TERMINAL",
-                "Task already terminal"
-            )
-
-        c.execute(
-            """UPDATE tasks
-               SET state='TASK_STATE_CANCELED',
-                   updated_at=?
-               WHERE task_id=?
-               AND principal=?
-               AND state NOT IN (
-                   'TASK_STATE_COMPLETED',
-                   'TASK_STATE_CANCELED'
-               )""",
-            (
-                now(),
-                task_id,
-                principal
-            )
-        )
-
-        c.commit()
-
-        row = c.execute(
-            """SELECT * FROM tasks
-               WHERE task_id=? AND principal=?""",
-            (task_id, principal)
-        ).fetchone()
-
-    return JSONResponse(
-        media_type="application/a2a+json",
-        content=task_response(row)
-    )
+def
