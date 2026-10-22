@@ -1,10 +1,10 @@
-"""A2A 1.0 HTTP+JSON invoice action agent (FastAPI + SQLite), Cerebras-ready.
+"""A2A 1.0 HTTP+JSON invoice action agent (FastAPI + SQLite), Groq-ready (free tier).
 Run: uvicorn app:app --host 0.0.0.0 --port $PORT   (ONE worker only)
-Env: PUBLIC_BASE_URL (exact URL you submit, e.g. https://x.onrender.com/a2a/)
-     LLM_API_KEY, LLM_BASE_URL (default Cerebras), LLM_MODEL, LLM_CHUNK (default 6)
+Env: PUBLIC_BASE_URL (exact URL you submit, e.g. https://x.hf.space/a2a/)
+     LLM_API_KEY, LLM_BASE_URL (default Groq), LLM_MODEL, LLM_CHUNK (default 3)
      DB_PATH (default /tmp/agent.db), AGENT_TOKEN + STRICT_TOKENS=1 (optional)
 """
-import os, json, hashlib, uuid, asyncio, sqlite3, re, datetime, threading
+import os, json, hashlib, uuid, asyncio, sqlite3, re, datetime, threading, time
 from urllib.parse import urlparse
 from collections import defaultdict
 import httpx
@@ -13,13 +13,14 @@ from fastapi.responses import Response
 
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://example.com/a2a/")
 BASE_PATH = urlparse(PUBLIC_BASE_URL).path.rstrip("/")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.cerebras.ai/v1").rstrip("/")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss-120b")  # check exact name in your Cerebras dashboard
-CHUNK = int(os.environ.get("LLM_CHUNK", "6"))
+LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+CHUNK = int(os.environ.get("LLM_CHUNK", "3"))
 DB_PATH = os.environ.get("DB_PATH", "/tmp/agent.db")
 AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
 STRICT = os.environ.get("STRICT_TOKENS") == "1"
+BUDGET = float(os.environ.get("LLM_BUDGET_SECONDS", "32"))  # keep under the 45 s request limit
 
 MT_BATCH = "application/vnd.ga5.invoice-claim-batch+json"
 MT_PROP = "application/vnd.ga5.invoice-action-proposals+json"
@@ -153,7 +154,7 @@ def valid_decision(d, pkg_text):
         return False
 
 
-async def llm_call_one(items, policy, hint=""):
+async def llm_call_one(items, policy, hint, deadline):
     body = {"model": LLM_MODEL, "temperature": 0,
             "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM},
@@ -161,10 +162,16 @@ async def llm_call_one(items, policy, hint=""):
                           json.dumps([{"i": i, "package": p} for i, p in items], ensure_ascii=False)}]}
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
     async with httpx.AsyncClient(timeout=40) as c:
-        for attempt in range(3):
+        for attempt in range(4):
+            if time.monotonic() > deadline:
+                break
             r = await c.post(LLM_BASE_URL + "/chat/completions", json=body, headers=headers)
             if r.status_code == 429:
-                await asyncio.sleep(2 * (attempt + 1))
+                try:
+                    wait = float(r.headers.get("retry-after", "5"))
+                except ValueError:
+                    wait = 5
+                await asyncio.sleep(min(wait + 0.5, 15))
                 continue
             if r.status_code == 400 and "response_format" in body:
                 body.pop("response_format")  # provider rejected JSON mode; retry without it
@@ -173,14 +180,16 @@ async def llm_call_one(items, policy, hint=""):
             txt = r.json()["choices"][0]["message"]["content"] or ""
             m = re.search(r"\{.*\}", txt, re.S)
             return {d["i"]: d for d in json.loads(m.group(0))["decisions"]}
-    raise RuntimeError("llm failed")
+    raise RuntimeError("llm failed or out of time")
 
 
-async def llm_call(items, policy, hint=""):
+async def llm_call(items, policy, hint, deadline):
     res = {}
     for s in range(0, len(items), CHUNK):
+        if time.monotonic() > deadline:
+            break
         try:
-            res.update(await llm_call_one(items[s:s + CHUNK], policy, hint))
+            res.update(await llm_call_one(items[s:s + CHUNK], policy, hint, deadline))
         except Exception as ex:
             print("LLM chunk error:", repr(ex)[:300], flush=True)
     return res
@@ -197,6 +206,7 @@ def fallback(pkg_text):
 
 async def decide_batch(packages, policy):
     """Model calls only for uncached packages; cache by canonical package content."""
+    deadline = time.monotonic() + BUDGET
     keys = [sha(canon({k: v for k, v in p.items() if k != "packageId"})) for p in packages]
     texts = [json.dumps(p, ensure_ascii=False) for p in packages]
     res = {}
@@ -207,10 +217,11 @@ async def decide_batch(packages, policy):
                 res[i] = json.loads(r[0])
     todo = [i for i in range(len(packages)) if i not in res]
     for attempt in range(2):
-        if not todo:
+        if not todo or time.monotonic() > deadline:
             break
         got = await llm_call([(i, packages[i]) for i in todo], policy,
-                             "" if attempt == 0 else "Previous output was invalid: give exactly 3 distinct evidenceRefs copied verbatim from the package text, integer amountMinor, valid action.")
+                             "" if attempt == 0 else "Previous output was invalid: give exactly 3 distinct evidenceRefs copied verbatim from the package text, integer amountMinor, valid action.",
+                             deadline)
         for i in list(todo):
             d = got.get(i)
             if d and valid_decision(d, texts[i]):
