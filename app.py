@@ -1,7 +1,8 @@
-"""A2A 1.0 HTTP+JSON invoice action agent (FastAPI + SQLite).
+"""A2A 1.0 HTTP+JSON invoice action agent (FastAPI + SQLite), Cerebras-ready.
 Run: uvicorn app:app --host 0.0.0.0 --port $PORT   (ONE worker only)
-Env: PUBLIC_BASE_URL (exact URL you submit), LLM_BASE_URL, LLM_API_KEY, LLM_MODEL,
-     DB_PATH (on a persistent disk), AGENT_TOKEN (optional), STRICT_TOKENS=1 (optional)
+Env: PUBLIC_BASE_URL (exact URL you submit, e.g. https://x.onrender.com/a2a/)
+     LLM_API_KEY, LLM_BASE_URL (default Cerebras), LLM_MODEL, LLM_CHUNK (default 6)
+     DB_PATH (default /tmp/agent.db), AGENT_TOKEN + STRICT_TOKENS=1 (optional)
 """
 import os, json, hashlib, uuid, asyncio, sqlite3, re, datetime, threading
 from urllib.parse import urlparse
@@ -12,10 +13,11 @@ from fastapi.responses import Response
 
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://example.com/a2a/")
 BASE_PATH = urlparse(PUBLIC_BASE_URL).path.rstrip("/")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.cerebras.ai/v1").rstrip("/")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-DB_PATH = os.environ.get("DB_PATH", "agent.db")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss-120b")  # check exact name in your Cerebras dashboard
+CHUNK = int(os.environ.get("LLM_CHUNK", "6"))
+DB_PATH = os.environ.get("DB_PATH", "/tmp/agent.db")
 AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
 STRICT = os.environ.get("STRICT_TOKENS") == "1"
 
@@ -116,6 +118,11 @@ async def card():
     })
 
 
+@app.get("/")
+async def root():
+    return out({"ok": True})
+
+
 # ---------------- LLM layer ----------------
 SYSTEM = """You are an accounts-payable analyst. For EACH invoice package choose exactly one action:
 - settle_invoice: valid, reconciled, within autonomous authority.
@@ -146,19 +153,37 @@ def valid_decision(d, pkg_text):
         return False
 
 
-async def llm_call(items, policy, hint=""):
+async def llm_call_one(items, policy, hint=""):
     body = {"model": LLM_MODEL, "temperature": 0,
             "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM},
                          {"role": "user", "content": f"Policy revision: {policy}\n{hint}\nPackages:\n" +
                           json.dumps([{"i": i, "package": p} for i, p in items], ensure_ascii=False)}]}
-    async with httpx.AsyncClient(timeout=38) as c:
-        r = await c.post(LLM_BASE_URL + "/chat/completions", json=body,
-                         headers={"Authorization": f"Bearer {LLM_API_KEY}"})
-        r.raise_for_status()
-        txt = r.json()["choices"][0]["message"]["content"]
-    txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
-    return {d["i"]: d for d in json.loads(txt)["decisions"]}
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    async with httpx.AsyncClient(timeout=40) as c:
+        for attempt in range(3):
+            r = await c.post(LLM_BASE_URL + "/chat/completions", json=body, headers=headers)
+            if r.status_code == 429:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            if r.status_code == 400 and "response_format" in body:
+                body.pop("response_format")  # provider rejected JSON mode; retry without it
+                continue
+            r.raise_for_status()
+            txt = r.json()["choices"][0]["message"]["content"] or ""
+            m = re.search(r"\{.*\}", txt, re.S)
+            return {d["i"]: d for d in json.loads(m.group(0))["decisions"]}
+    raise RuntimeError("llm failed")
+
+
+async def llm_call(items, policy, hint=""):
+    res = {}
+    for s in range(0, len(items), CHUNK):
+        try:
+            res.update(await llm_call_one(items[s:s + CHUNK], policy, hint))
+        except Exception as ex:
+            print("LLM chunk error:", repr(ex)[:300], flush=True)
+    return res
 
 
 def fallback(pkg_text):
@@ -171,7 +196,7 @@ def fallback(pkg_text):
 
 
 async def decide_batch(packages, policy):
-    """One batched model call for uncached packages; cache by canonical package content."""
+    """Model calls only for uncached packages; cache by canonical package content."""
     keys = [sha(canon({k: v for k, v in p.items() if k != "packageId"})) for p in packages]
     texts = [json.dumps(p, ensure_ascii=False) for p in packages]
     res = {}
@@ -184,11 +209,8 @@ async def decide_batch(packages, policy):
     for attempt in range(2):
         if not todo:
             break
-        try:
-            got = await llm_call([(i, packages[i]) for i in todo], policy,
-                                 "" if attempt == 0 else "Previous output was invalid: give exactly 3 evidenceRefs copied verbatim from the package text, integer amountMinor, valid action.")
-        except Exception:
-            continue
+        got = await llm_call([(i, packages[i]) for i in todo], policy,
+                             "" if attempt == 0 else "Previous output was invalid: give exactly 3 distinct evidenceRefs copied verbatim from the package text, integer amountMinor, valid action.")
         for i in list(todo):
             d = got.get(i)
             if d and valid_decision(d, texts[i]):
@@ -196,7 +218,7 @@ async def decide_batch(packages, policy):
                 with dblock:
                     db.execute("INSERT OR REPLACE INTO cache VALUES(?,?)", (keys[i], json.dumps(d)))
                 todo.remove(i)
-    for i in todo:  # not cached: transient fallback
+    for i in todo:  # not cached on purpose, so a later retry can try again
         res[i] = fallback(texts[i])
     return [res[i] for i in range(len(packages))]
 
@@ -204,10 +226,10 @@ async def decide_batch(packages, policy):
 def make_proposal(pkg, d, task_id):
     pid = pkg["packageId"]
     refs = d["evidenceRefs"]
-    rationale = (f"Action {d['action']} for invoice {d['facts_invoice'] if 'facts_invoice' in d else d['invoiceNumber']} "
-                 f"from {d['vendorName']}: {d.get('reason', '')} Decisive evidence: {refs[0]}, {refs[1]} and {refs[2]}.")
+    rationale = (f"Action {d['action']} for invoice {d['invoiceNumber']} from {d['vendorName']}: "
+                 f"{d.get('reason', '')} Decisive evidence: {refs[0]}, {refs[1]} and {refs[2]}.")
     if len(rationale) < 60:
-        rationale += " " * 0 + " This follows the stated policy for the cited records."
+        rationale += " This follows the stated policy for the cited records."
     return {"packageId": pid,
             "actionId": "act_" + sha(f"{task_id}:{pid}:{d['action']}")[:28],
             "action": d["action"],
@@ -219,10 +241,12 @@ def make_proposal(pkg, d, task_id):
 # ---------------- Routes ----------------
 def find_part(msg, mt):
     parts = msg.get("parts")
-    if not isinstance(parts, list):
+    if not isinstance(parts, list) or len(parts) != 1:
         return None
-    ps = [p for p in parts if isinstance(p, dict) and p.get("mediaType") == mt]
-    return ps[0].get("data") if len(ps) == 1 and len(parts) == 1 and isinstance(ps[0].get("data"), dict) else None
+    p = parts[0]
+    if isinstance(p, dict) and p.get("mediaType") == mt and isinstance(p.get("data"), dict):
+        return p["data"]
+    return None
 
 
 @app.post(BASE_PATH + "/message:send")
@@ -245,8 +269,7 @@ async def message_send(request: Request):
         if row:
             if row[0] != h:
                 return err(409, "IDEMPOTENCY_CONFLICT", "Message ID reused with different content")
-            t = load_task(row[1], principal)
-            return out({"task": t})
+            return out({"task": load_task(row[1], principal)})
         if msg.get("taskId"):
             return await continuation(principal, msg, mid, h)
         data = find_part(msg, MT_BATCH)
@@ -285,8 +308,6 @@ async def continuation(principal, msg, mid, h):
             return err(404, "NOT_FOUND", "Task not found")
         if msg.get("contextId") != task["contextId"]:
             return err(400, "INVALID_ARGUMENT", "Context mismatch")
-        if task["status"]["state"] in TERMINAL:
-            return err(409, "TASK_NOT_ACTIVE", "Task is not active")
         if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED":
             return err(409, "TASK_NOT_ACTIVE", "Task is not awaiting input")
         data = find_part(msg, MT_RES)
