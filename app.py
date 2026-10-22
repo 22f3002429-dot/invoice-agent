@@ -760,7 +760,7 @@ async def handle_results(
             )
 
         stored_proposals = {
-            row_item["packageId"]: row_item
+            row_item["package_id"]: row_item
             for row_item in c.execute(
                 "SELECT * FROM proposals WHERE task_id=?",
                 (task_id,)
